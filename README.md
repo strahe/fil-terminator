@@ -5,14 +5,9 @@ Filecoin 矿工扇区终结费用计算工具，支持历史查询、未来预�
 ## 安装
 
 ```bash
-go install github.com/strahe/fil-terminator/cmd/fil-terminator@latest
-```
-
-或源码编译：
-```bash
 git clone https://github.com/strahe/fil-terminator.git
 cd fil-terminator
-make build
+make
 ```
 
 ## 基本使用
