@@ -201,15 +201,15 @@ func getGenesisTime(cctx *cli.Context, offline bool) (time.Time, error) {
 }
 
 type ExpirationStats struct {
-	DaysFromNow int
-	SectorCount int
-	Miners      map[string]int
+	ExpirationDate string
+	SectorCount    int
+	Miners         map[string]int
 }
 
 type MinerExpirationData struct {
 	MinerID   string
 	Sectors   int
-	ExpiryMap map[int]int // days -> sector count
+	ExpiryMap map[string]int // date -> sector count
 }
 
 func sectorExpirationAction(cctx *cli.Context) error {
@@ -280,16 +280,22 @@ func sectorExpirationAction(cctx *cli.Context) error {
 
 	fmt.Printf("Processing %d miners at reference epoch %d...\n", len(miners), refEpoch)
 
+	// Get genesis time for date calculation
+	genesisTime, err := getGenesisTime(cctx, false)
+	if err != nil {
+		return fmt.Errorf("failed to get genesis time: %w", err)
+	}
+
 	// Collect expiration data
 	minerData := make([]MinerExpirationData, 0, len(miners))
-	overallStats := make(map[int]*ExpirationStats)
+	overallStats := make(map[string]*ExpirationStats)
 
 	for i, minerStr := range miners {
 		if cctx.Bool("verbose") {
 			fmt.Printf("[%d/%d] Processing miner %s...\n", i+1, len(miners), minerStr)
 		}
 
-		data, err := getMinerExpirationData(ctx, api, minerStr, refEpoch)
+		data, err := getMinerExpirationData(ctx, api, minerStr, refEpoch, genesisTime)
 		if err != nil {
 			fmt.Printf("Warning: Failed to process miner %s: %v\n", minerStr, err)
 			continue
@@ -298,16 +304,16 @@ func sectorExpirationAction(cctx *cli.Context) error {
 		minerData = append(minerData, data)
 
 		// Update overall statistics
-		for days, count := range data.ExpiryMap {
-			if overallStats[days] == nil {
-				overallStats[days] = &ExpirationStats{
-					DaysFromNow: days,
-					SectorCount: 0,
-					Miners:      make(map[string]int),
+		for dateStr, count := range data.ExpiryMap {
+			if overallStats[dateStr] == nil {
+				overallStats[dateStr] = &ExpirationStats{
+					ExpirationDate: dateStr,
+					SectorCount:    0,
+					Miners:         make(map[string]int),
 				}
 			}
-			overallStats[days].SectorCount += count
-			overallStats[days].Miners[data.MinerID] = count
+			overallStats[dateStr].SectorCount += count
+			overallStats[dateStr].Miners[data.MinerID] = count
 		}
 	}
 
@@ -404,7 +410,7 @@ func readMinersFromCSV(file *os.File) ([]string, error) {
 	return miners, nil
 }
 
-func getMinerExpirationData(ctx context.Context, api api.FullNode, minerStr string, refEpoch abi.ChainEpoch) (MinerExpirationData, error) {
+func getMinerExpirationData(ctx context.Context, api api.FullNode, minerStr string, refEpoch abi.ChainEpoch, genesisTime time.Time) (MinerExpirationData, error) {
 	// Parse miner address
 	mid, err := address.NewFromString(minerStr)
 	if err != nil {
@@ -424,10 +430,11 @@ func getMinerExpirationData(ctx context.Context, api api.FullNode, minerStr stri
 	}
 
 	// Calculate expiration distribution
-	expiryMap := make(map[int]int)
+	expiryMap := make(map[string]int)
 	for _, sector := range sectors {
-		daysToExpiry := int(utils.EpochsToDays(sector.Expiration - refEpoch))
-		expiryMap[daysToExpiry]++
+		expirationTime := utils.EpochToTime(sector.Expiration, genesisTime)
+		dateStr := expirationTime.Format("2006-01-02")
+		expiryMap[dateStr]++
 	}
 
 	return MinerExpirationData{
@@ -437,7 +444,7 @@ func getMinerExpirationData(ctx context.Context, api api.FullNode, minerStr stri
 	}, nil
 }
 
-func printExpirationResults(minerData []MinerExpirationData, overallStats map[int]*ExpirationStats, verbose bool) {
+func printExpirationResults(minerData []MinerExpirationData, overallStats map[string]*ExpirationStats, verbose bool) {
 	fmt.Printf("\n=== Sector Expiration Distribution ===\n")
 
 	if verbose {
@@ -446,60 +453,45 @@ func printExpirationResults(minerData []MinerExpirationData, overallStats map[in
 		for _, data := range minerData {
 			fmt.Printf("\nMiner: %s (Total sectors: %d)\n", data.MinerID, data.Sectors)
 
-			// Sort days
-			var days []int
-			for d := range data.ExpiryMap {
-				days = append(days, d)
+			// Sort dates
+			var dates []string
+			for dateStr := range data.ExpiryMap {
+				dates = append(dates, dateStr)
 			}
-			sort.Ints(days)
+			sort.Strings(dates)
 
-			for _, d := range days {
-				count := data.ExpiryMap[d]
-				if d < 0 {
-					fmt.Printf("  Expired %d days ago: %d sectors\n", -d, count)
-				} else if d == 0 {
-					fmt.Printf("  Expires today: %d sectors\n", count)
-				} else {
-					fmt.Printf("  Expires in %d days: %d sectors\n", d, count)
-				}
+			for _, dateStr := range dates {
+				count := data.ExpiryMap[dateStr]
+				fmt.Printf("  Expires on %s: %d sectors\n", dateStr, count)
 			}
 		}
 	}
 
 	// Print overall statistics
 	fmt.Printf("\n--- Overall Distribution ---\n")
-	fmt.Printf("%-15s %-10s %-10s\n", "Days from now", "Sectors", "Miners")
-	fmt.Println(strings.Repeat("-", 40))
+	fmt.Printf("%-12s %-10s %-10s\n", "Date", "Sectors", "Miners")
+	fmt.Println(strings.Repeat("-", 35))
 
-	// Sort days
-	var days []int
-	for d := range overallStats {
-		days = append(days, d)
+	// Sort dates
+	var dates []string
+	for dateStr := range overallStats {
+		dates = append(dates, dateStr)
 	}
-	sort.Ints(days)
+	sort.Strings(dates)
 
 	totalSectors := 0
-	for _, d := range days {
-		stats := overallStats[d]
+	for _, dateStr := range dates {
+		stats := overallStats[dateStr]
 		totalSectors += stats.SectorCount
 
-		dayStr := ""
-		if d < 0 {
-			dayStr = fmt.Sprintf("-%d (expired)", -d)
-		} else if d == 0 {
-			dayStr = "0 (today)"
-		} else {
-			dayStr = fmt.Sprintf("+%d", d)
-		}
-
-		fmt.Printf("%-15s %-10d %-10d\n", dayStr, stats.SectorCount, len(stats.Miners))
+		fmt.Printf("%-12s %-10d %-10d\n", dateStr, stats.SectorCount, len(stats.Miners))
 	}
 
 	fmt.Printf("\nTotal sectors: %d\n", totalSectors)
 	fmt.Printf("Total miners: %d\n", len(minerData))
 }
 
-func writeExpirationCSV(filename string, minerData []MinerExpirationData, overallStats map[int]*ExpirationStats) error {
+func writeExpirationCSV(filename string, minerData []MinerExpirationData, overallStats map[string]*ExpirationStats) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -514,22 +506,21 @@ func writeExpirationCSV(filename string, minerData []MinerExpirationData, overal
 		return err
 	}
 
-	if err := writer.Write([]string{"Days from now", "Sectors", "Miners"}); err != nil {
+	if err := writer.Write([]string{"Date", "Sectors", "Miners"}); err != nil {
 		return err
 	}
 
-	// Sort days
-	var days []int
-	for d := range overallStats {
-		days = append(days, d)
+	// Sort dates
+	var dates []string
+	for dateStr := range overallStats {
+		dates = append(dates, dateStr)
 	}
-	sort.Ints(days)
+	sort.Strings(dates)
 
-	for _, d := range days {
-		stats := overallStats[d]
-		dayStr := strconv.Itoa(d)
+	for _, dateStr := range dates {
+		stats := overallStats[dateStr]
 		if err := writer.Write([]string{
-			dayStr,
+			dateStr,
 			strconv.Itoa(stats.SectorCount),
 			strconv.Itoa(len(stats.Miners)),
 		}); err != nil {
@@ -549,21 +540,21 @@ func writeExpirationCSV(filename string, minerData []MinerExpirationData, overal
 		if err := writer.Write([]string{fmt.Sprintf("Miner: %s", data.MinerID)}); err != nil {
 			return err
 		}
-		if err := writer.Write([]string{"Days from now", "Sectors"}); err != nil {
+		if err := writer.Write([]string{"Date", "Sectors"}); err != nil {
 			return err
 		}
 
-		// Sort days for this miner
-		var minerDays []int
-		for d := range data.ExpiryMap {
-			minerDays = append(minerDays, d)
+		// Sort dates for this miner
+		var minerDates []string
+		for dateStr := range data.ExpiryMap {
+			minerDates = append(minerDates, dateStr)
 		}
-		sort.Ints(minerDays)
+		sort.Strings(minerDates)
 
-		for _, d := range minerDays {
-			count := data.ExpiryMap[d]
+		for _, dateStr := range minerDates {
+			count := data.ExpiryMap[dateStr]
 			if err := writer.Write([]string{
-				strconv.Itoa(d),
+				dateStr,
 				strconv.Itoa(count),
 			}); err != nil {
 				return err
