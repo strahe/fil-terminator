@@ -18,6 +18,7 @@ func main() {
 		Commands: []*cli.Command{
 			calCmd,
 			batchCmd,
+			batch1Cmd,
 			toolsCmd,
 		},
 	}

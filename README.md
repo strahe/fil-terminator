@@ -44,6 +44,37 @@ f05678,2100000
 
 **注意：** 扇区过期分布分析支持使用相同的 CSV 文件，会自动提取 `minerid` 列
 
+### 智能批量计算（策略优化）
+
+```bash
+# 基于矿工列表和统一终结时间进行策略优化计算
+./fil-terminator batch1 --input miners.csv --termination-epoch 2500000 --threshold 7
+
+# 单个矿工计算
+./fil-terminator batch1 --input f01234 --termination-epoch 2500000 --threshold 10
+
+# 关闭优化策略，全部按指定时间终结
+./fil-terminator batch1 --input miners.csv --termination-epoch 2500000 --threshold 0
+
+# 详细输出并保存结果
+./fil-terminator batch1 --input miners.csv --termination-epoch 2500000 --threshold 7 --verbose --output strategy-results.csv
+```
+
+**batch1 命令特点：**
+- 只需要矿工ID列表，无需指定每个矿工的终结时间
+- 统一的终结时间点，通过 `--termination-epoch` 参数指定
+- 智能策略：对于距离终结时间较近（默认7天内）即将过期的扇区，选择让其自然过期而非主动终结
+- 分别计算终结费用和过期费用，给出最优策略建议
+- 阈值可调：通过 `--threshold` 参数调整过期阈值天数（设为0则关闭优化，全部终结）
+
+输入CSV格式（仅需矿工ID）：
+```csv
+minerid
+f01234
+f05678
+f09999
+```
+
 ### 工具功能
 
 ```bash
