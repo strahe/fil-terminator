@@ -42,6 +42,8 @@ f01234,2000000
 f05678,2100000
 ```
 
+**注意：** 扇区过期分布分析支持使用相同的 CSV 文件，会自动提取 `minerid` 列
+
 ### 工具功能
 
 ```bash
@@ -58,7 +60,22 @@ f05678,2100000
 
 # 指定时区
 ./fil-terminator tools e2t --epoch 2000000 --timezone UTC
+
+# 扇区过期时间分布分析
+./fil-terminator tools sector-expiration --miner f01234
+./fil-terminator tools exp --miners f01234,f05678,f09999
+./fil-terminator tools exp --file miners.txt --output expiration-report.csv
+./fil-terminator tools exp --miner f01234 --epoch 2000000 --verbose
 ```
+
+**扇区过期分布分析支持：**
+- 单个矿工：`--miner f01234`
+- 多个矿工：`--miners f01234,f05678,f09999`
+- 文件批量：`--file miners.txt` (每行一个矿工地址)
+- CSV 文件：`--file miners.csv` (支持 `minerid` 或 `miner` 列，与 batch 命令兼容)
+- 指定参考高度：`--epoch 2000000`
+- 详细输出：`--verbose`
+- 导出 CSV：`--output report.csv`
 
 **支持的时间格式：**
 - `2024-01-01 12:00:00` (本地时间)
