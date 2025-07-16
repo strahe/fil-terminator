@@ -202,6 +202,8 @@ func getGenesisTime(cctx *cli.Context, offline bool) (time.Time, error) {
 
 type ExpirationStats struct {
 	ExpirationDate string
+	MinEpoch       abi.ChainEpoch
+	MaxEpoch       abi.ChainEpoch
 	SectorCount    int
 	Miners         map[string]int
 }
@@ -295,7 +297,7 @@ func sectorExpirationAction(cctx *cli.Context) error {
 			fmt.Printf("[%d/%d] Processing miner %s...\n", i+1, len(miners), minerStr)
 		}
 
-		data, err := getMinerExpirationData(ctx, api, minerStr, refEpoch, genesisTime)
+		data, epochData, err := getMinerExpirationDataWithEpochs(ctx, api, minerStr, refEpoch, genesisTime)
 		if err != nil {
 			fmt.Printf("Warning: Failed to process miner %s: %v\n", minerStr, err)
 			continue
@@ -308,12 +310,26 @@ func sectorExpirationAction(cctx *cli.Context) error {
 			if overallStats[dateStr] == nil {
 				overallStats[dateStr] = &ExpirationStats{
 					ExpirationDate: dateStr,
+					MinEpoch:       abi.ChainEpoch(^uint64(0) >> 1), // max int64
+					MaxEpoch:       0,
 					SectorCount:    0,
 					Miners:         make(map[string]int),
 				}
 			}
 			overallStats[dateStr].SectorCount += count
 			overallStats[dateStr].Miners[data.MinerID] = count
+
+			// Update epoch ranges
+			if epochs, exists := epochData[dateStr]; exists {
+				for _, epoch := range epochs {
+					if epoch < overallStats[dateStr].MinEpoch {
+						overallStats[dateStr].MinEpoch = epoch
+					}
+					if epoch > overallStats[dateStr].MaxEpoch {
+						overallStats[dateStr].MaxEpoch = epoch
+					}
+				}
+			}
 		}
 	}
 
@@ -410,38 +426,40 @@ func readMinersFromCSV(file *os.File) ([]string, error) {
 	return miners, nil
 }
 
-func getMinerExpirationData(ctx context.Context, api api.FullNode, minerStr string, refEpoch abi.ChainEpoch, genesisTime time.Time) (MinerExpirationData, error) {
+func getMinerExpirationDataWithEpochs(ctx context.Context, api api.FullNode, minerStr string, refEpoch abi.ChainEpoch, genesisTime time.Time) (MinerExpirationData, map[string][]abi.ChainEpoch, error) {
 	// Parse miner address
 	mid, err := address.NewFromString(minerStr)
 	if err != nil {
-		return MinerExpirationData{}, fmt.Errorf("invalid miner address: %w", err)
+		return MinerExpirationData{}, nil, fmt.Errorf("invalid miner address: %w", err)
 	}
 
 	// Get tipset for reference epoch
 	ts, err := api.ChainGetTipSetByHeight(ctx, refEpoch, types.EmptyTSK)
 	if err != nil {
-		return MinerExpirationData{}, fmt.Errorf("failed to get tipset: %w", err)
+		return MinerExpirationData{}, nil, fmt.Errorf("failed to get tipset: %w", err)
 	}
 
 	// Get all sectors
 	sectors, err := api.StateMinerSectors(ctx, mid, nil, ts.Key())
 	if err != nil {
-		return MinerExpirationData{}, fmt.Errorf("failed to get sectors: %w", err)
+		return MinerExpirationData{}, nil, fmt.Errorf("failed to get sectors: %w", err)
 	}
 
 	// Calculate expiration distribution
 	expiryMap := make(map[string]int)
+	epochMap := make(map[string][]abi.ChainEpoch) // Track epochs for each date
 	for _, sector := range sectors {
 		expirationTime := utils.EpochToTime(sector.Expiration, genesisTime)
 		dateStr := expirationTime.Format("2006-01-02")
 		expiryMap[dateStr]++
+		epochMap[dateStr] = append(epochMap[dateStr], sector.Expiration)
 	}
 
 	return MinerExpirationData{
 		MinerID:   minerStr,
 		Sectors:   len(sectors),
 		ExpiryMap: expiryMap,
-	}, nil
+	}, epochMap, nil
 }
 
 func printExpirationResults(minerData []MinerExpirationData, overallStats map[string]*ExpirationStats, verbose bool) {
@@ -469,8 +487,8 @@ func printExpirationResults(minerData []MinerExpirationData, overallStats map[st
 
 	// Print overall statistics
 	fmt.Printf("\n--- Overall Distribution ---\n")
-	fmt.Printf("%-12s %-10s %-10s\n", "Date", "Sectors", "Miners")
-	fmt.Println(strings.Repeat("-", 35))
+	fmt.Printf("%-12s %-20s %-10s %-s\n", "Date", "Epoch Range", "Sectors", "Miners")
+	fmt.Println(strings.Repeat("-", 80))
 
 	// Sort dates
 	var dates []string
@@ -484,7 +502,20 @@ func printExpirationResults(minerData []MinerExpirationData, overallStats map[st
 		stats := overallStats[dateStr]
 		totalSectors += stats.SectorCount
 
-		fmt.Printf("%-12s %-10d %-10d\n", dateStr, stats.SectorCount, len(stats.Miners))
+		epochRange := fmt.Sprintf("%d-%d", stats.MinEpoch, stats.MaxEpoch)
+		if stats.MinEpoch == stats.MaxEpoch {
+			epochRange = fmt.Sprintf("%d", stats.MinEpoch)
+		}
+
+		// Build miner list
+		var minerList []string
+		for minerID := range stats.Miners {
+			minerList = append(minerList, minerID)
+		}
+		sort.Strings(minerList)
+		minersStr := strings.Join(minerList, ",")
+
+		fmt.Printf("%-12s %-20s %-10d %s\n", dateStr, epochRange, stats.SectorCount, minersStr)
 	}
 
 	fmt.Printf("\nTotal sectors: %d\n", totalSectors)
@@ -506,7 +537,7 @@ func writeExpirationCSV(filename string, minerData []MinerExpirationData, overal
 		return err
 	}
 
-	if err := writer.Write([]string{"Date", "Sectors", "Miners"}); err != nil {
+	if err := writer.Write([]string{"Date", "Epoch Range", "Sectors", "Miners"}); err != nil {
 		return err
 	}
 
@@ -519,10 +550,25 @@ func writeExpirationCSV(filename string, minerData []MinerExpirationData, overal
 
 	for _, dateStr := range dates {
 		stats := overallStats[dateStr]
+
+		epochRange := fmt.Sprintf("%d-%d", stats.MinEpoch, stats.MaxEpoch)
+		if stats.MinEpoch == stats.MaxEpoch {
+			epochRange = fmt.Sprintf("%d", stats.MinEpoch)
+		}
+
+		// Build miner list
+		var minerList []string
+		for minerID := range stats.Miners {
+			minerList = append(minerList, minerID)
+		}
+		sort.Strings(minerList)
+		minersStr := strings.Join(minerList, ",")
+
 		if err := writer.Write([]string{
 			dateStr,
+			epochRange,
 			strconv.Itoa(stats.SectorCount),
-			strconv.Itoa(len(stats.Miners)),
+			minersStr,
 		}); err != nil {
 			return err
 		}
