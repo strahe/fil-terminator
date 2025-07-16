@@ -48,8 +48,9 @@ EXAMPLES:
    fil-terminator batch1 -i miners.csv -e 2500000 -t 7 -v -o results.csv
 
 STRATEGY:
-   - When threshold > 0: Sectors expiring within threshold days after termination epoch will be left to expire naturally
+   - When threshold > 0: Sectors expiring before (termination-epoch + threshold days) will expire naturally, others will be terminated
    - When threshold = 0: All sectors will be terminated at the specified epoch (no optimization)
+   - Example: threshold=7 means sectors expiring within 7 days after termination epoch will expire naturally
    - The tool calculates both termination and expiration costs to find the optimal strategy`,
 	Flags: []cli.Flag{
 		&cli.StringFlag{
@@ -72,7 +73,7 @@ STRATEGY:
 		&cli.IntFlag{
 			Name:    "expiration-threshold",
 			Aliases: []string{"threshold", "t"},
-			Usage:   "Days threshold: sectors expiring within this many days after termination epoch will not be terminated (0 = disable optimization, terminate all)",
+			Usage:   "Days threshold: sectors expiring before (termination-epoch + threshold days) will expire naturally, others will be terminated (0 = disable optimization, terminate all)",
 			Value:   7,
 		},
 		&cli.BoolFlag{
@@ -477,6 +478,8 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, task MinerStr
 		sectorDetail.ExpirationFee = expFee
 
 		// Decide strategy based on threshold
+		// Logic: sectors expiring BEFORE (termination-epoch + threshold) should expire naturally
+		//        sectors expiring AFTER (termination-epoch + threshold) should be terminated
 		if task.ExpirationThreshold == 0 {
 			// Threshold is 0: disable optimization, terminate all sectors
 			sectorDetail.Strategy = "terminate"
@@ -484,13 +487,13 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, task MinerStr
 			terminationFee = big.Add(terminationFee, termFee)
 			terminateCount++
 		} else if remainingEpochs <= thresholdEpochs {
-			// Let it expire
+			// Sector expires within threshold days after termination epoch - let it expire naturally
 			sectorDetail.Strategy = "expire"
 			sectorDetail.RecommendedFee = expFee
 			expirationFee = big.Add(expirationFee, expFee)
 			expireCount++
 		} else {
-			// Terminate immediately
+			// Sector expires beyond threshold - terminate it now
 			sectorDetail.Strategy = "terminate"
 			sectorDetail.RecommendedFee = termFee
 			terminationFee = big.Add(terminationFee, termFee)
@@ -584,9 +587,9 @@ func writeStrategyResults(filename string, results []StrategyResult) error {
 
 func printStrategyResults(results []StrategyResult, verbose bool) {
 	fmt.Printf("\n=== Strategy Results ===\n")
-	fmt.Printf("%-12s %-10s %-8s %-6s %-6s %-6s %-20s %-20s %-20s %s\n",
+	fmt.Printf("%-12s %-10s %-8s %-6s %-6s %-6s %-25s %-25s %-25s %s\n",
 		"MinerID", "Epoch", "Status", "Total", "Term.", "Exp.", "TermFee(FIL)", "ExpFee(FIL)", "TotalFee(FIL)", "Error")
-	fmt.Println(strings.Repeat("-", 135))
+	fmt.Println(strings.Repeat("-", 150))
 
 	for _, result := range results {
 		errorMsg := result.Error
@@ -594,7 +597,7 @@ func printStrategyResults(results []StrategyResult, verbose bool) {
 			errorMsg = errorMsg[:20] + "..."
 		}
 
-		fmt.Printf("%-12s %-10d %-8s %-6d %-6d %-6d %-20s %-20s %-20s %s\n",
+		fmt.Printf("%-12s %-10d %-8s %-6d %-6d %-6d %-25s %-25s %-25s %s\n",
 			result.MinerID,
 			result.TerminationEpoch,
 			result.Status,
