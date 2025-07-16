@@ -5,7 +5,9 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
@@ -78,6 +80,12 @@ STRATEGY:
 			Aliases: []string{"v"},
 			Usage:   "Verbose output",
 		},
+		&cli.IntFlag{
+			Name:    "workers",
+			Aliases: []string{"w"},
+			Usage:   "Number of concurrent workers",
+			Value:   runtime.NumCPU(),
+		},
 		&cli.StringFlag{
 			Name:  "api-url",
 			Usage: "Lotus API URL",
@@ -86,7 +94,16 @@ STRATEGY:
 	Action: batch1Calculate,
 }
 
+type MinerStrategyTask struct {
+	Index               int
+	MinerID             string
+	TerminationEpoch    abi.ChainEpoch
+	ExpirationThreshold int
+	Verbose             bool
+}
+
 type StrategyResult struct {
+	Index               int
 	MinerID             string
 	TerminationEpoch    abi.ChainEpoch
 	ExpirationThreshold int
@@ -134,6 +151,8 @@ func batch1Calculate(c *cli.Context) error {
 
 	terminationEpoch := abi.ChainEpoch(c.Int64("termination-epoch"))
 	expirationThreshold := c.Int("expiration-threshold")
+	workers := c.Int("workers")
+	verbose := c.Bool("verbose")
 
 	fmt.Printf("=== Batch1 Strategy Calculation ===\n")
 	fmt.Printf("Miners to process: %d\n", len(miners))
@@ -143,21 +162,16 @@ func batch1Calculate(c *cli.Context) error {
 	} else {
 		fmt.Printf("Expiration threshold: %d days\n", expirationThreshold)
 	}
+	fmt.Printf("Concurrent workers: %d\n", workers)
 	fmt.Printf("=====================================\n\n")
 
-	// Process each miner
-	results := make([]StrategyResult, 0, len(miners))
+	// Process miners concurrently
+	results := processMinersConcurrently(ctx, api, miners, terminationEpoch, expirationThreshold, workers, verbose)
+
+	// Calculate totals
 	totalTerminationFee := big.Zero()
 	totalExpirationFee := big.Zero()
-
-	for i, minerID := range miners {
-		if c.Bool("verbose") {
-			fmt.Printf("[%d/%d] Processing miner %s...\n", i+1, len(miners), minerID)
-		}
-
-		result := calculateMinerStrategy(ctx, api, minerID, terminationEpoch, expirationThreshold, c.Bool("verbose"))
-		results = append(results, result)
-
+	for _, result := range results {
 		if result.Error == "" {
 			totalTerminationFee = big.Add(totalTerminationFee, result.TerminationFee)
 			totalExpirationFee = big.Add(totalExpirationFee, result.ExpirationFee)
@@ -242,15 +256,73 @@ func readMinersFromCSVFile(filename string) ([]string, error) {
 	return miners, nil
 }
 
-func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID string, terminationEpoch abi.ChainEpoch, thresholdDays int, verbose bool) StrategyResult {
+func processMinersConcurrently(ctx context.Context, api api.FullNode, miners []string, terminationEpoch abi.ChainEpoch, expirationThreshold int, workers int, verbose bool) []StrategyResult {
+	// Create tasks
+	tasks := make([]MinerStrategyTask, len(miners))
+	for i, minerID := range miners {
+		tasks[i] = MinerStrategyTask{
+			Index:               i,
+			MinerID:             minerID,
+			TerminationEpoch:    terminationEpoch,
+			ExpirationThreshold: expirationThreshold,
+			Verbose:             verbose,
+		}
+	}
+
+	// Create channels
+	taskCh := make(chan MinerStrategyTask, len(tasks))
+	resultCh := make(chan StrategyResult, len(tasks))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskCh {
+				if verbose {
+					fmt.Printf("[Worker %d] Processing miner %s [%d/%d]...\n",
+						workerID, task.MinerID, task.Index+1, len(tasks))
+				}
+				result := calculateMinerStrategy(ctx, api, task)
+				resultCh <- result
+			}
+		}(i)
+	}
+
+	// Send tasks
+	go func() {
+		for _, task := range tasks {
+			taskCh <- task
+		}
+		close(taskCh)
+	}()
+
+	// Wait for workers to finish
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Collect results
+	results := make([]StrategyResult, len(miners))
+	for result := range resultCh {
+		results[result.Index] = result
+	}
+
+	return results
+}
+
+func calculateMinerStrategy(ctx context.Context, api api.FullNode, task MinerStrategyTask) StrategyResult {
 	result := StrategyResult{
-		MinerID:             minerID,
-		TerminationEpoch:    terminationEpoch,
-		ExpirationThreshold: thresholdDays,
+		Index:               task.Index,
+		MinerID:             task.MinerID,
+		TerminationEpoch:    task.TerminationEpoch,
+		ExpirationThreshold: task.ExpirationThreshold,
 	}
 
 	// Parse miner address
-	mid, err := address.NewFromString(minerID)
+	mid, err := address.NewFromString(task.MinerID)
 	if err != nil {
 		result.Error = fmt.Sprintf("invalid miner address: %v", err)
 		result.Status = "failed"
@@ -266,21 +338,21 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 	}
 
 	// Validate termination epoch
-	if terminationEpoch <= currentTs.Height() && terminationEpoch != 0 {
-		if verbose {
+	if task.TerminationEpoch <= currentTs.Height() && task.TerminationEpoch != 0 {
+		if task.Verbose {
 			fmt.Printf("  Warning: Termination epoch %d is in the past (current: %d)\n",
-				terminationEpoch, currentTs.Height())
+				task.TerminationEpoch, currentTs.Height())
 		}
 	}
 
 	// Get tipset at termination epoch
 	var ts *types.TipSet
-	if terminationEpoch > currentTs.Height() {
+	if task.TerminationEpoch > currentTs.Height() {
 		ts = currentTs // Use current for future estimation
 	} else {
-		ts, err = api.ChainGetTipSetByHeight(ctx, terminationEpoch, types.EmptyTSK)
+		ts, err = api.ChainGetTipSetByHeight(ctx, task.TerminationEpoch, types.EmptyTSK)
 		if err != nil {
-			result.Error = fmt.Sprintf("failed to get tipset at epoch %d: %v", terminationEpoch, err)
+			result.Error = fmt.Sprintf("failed to get tipset at epoch %d: %v", task.TerminationEpoch, err)
 			result.Status = "failed"
 			return result
 		}
@@ -345,8 +417,8 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 	result.TotalSectors = len(sectors)
 
 	if len(sectors) == 0 {
-		if verbose {
-			fmt.Printf("  Warning: Miner %s has no sectors\n", minerID)
+		if task.Verbose {
+			fmt.Printf("  Warning: Miner %s has no sectors\n", task.MinerID)
 		}
 		result.Status = "success"
 		return result
@@ -359,22 +431,22 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 	expireCount := 0
 	sectorDetails := make([]SectorStrategy, 0, len(sectors))
 
-	thresholdEpochs := abi.ChainEpoch(thresholdDays * 2880) // Convert days to epochs
+	thresholdEpochs := abi.ChainEpoch(task.ExpirationThreshold * 2880) // Convert days to epochs
 
 	for _, sector := range sectors {
 		// Skip already expired sectors
-		if terminationEpoch >= sector.Expiration {
+		if task.TerminationEpoch >= sector.Expiration {
 			continue
 		}
 
 		sectorDetail := SectorStrategy{
 			SectorNumber:    sector.SectorNumber,
 			ExpirationEpoch: sector.Expiration,
-			RemainingDays:   utils.EpochsToDays(sector.Expiration - terminationEpoch),
+			RemainingDays:   utils.EpochsToDays(sector.Expiration - task.TerminationEpoch),
 		}
 
 		// Calculate termination fee
-		sectorAge := terminationEpoch - sector.Activation
+		sectorAge := task.TerminationEpoch - sector.Activation
 		faultFee, err := miner.PledgePenaltyForContinuedFault(
 			nv,
 			builtin.FilterEstimate{
@@ -400,12 +472,12 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 		sectorDetail.DailyFaultFee = faultFee
 
 		// Calculate expiration fee (daily fault fee * remaining days)
-		remainingEpochs := sector.Expiration - terminationEpoch
+		remainingEpochs := sector.Expiration - task.TerminationEpoch
 		expFee := big.Mul(faultFee, big.NewInt(int64(remainingEpochs/2880))) // Daily fee * days
 		sectorDetail.ExpirationFee = expFee
 
 		// Decide strategy based on threshold
-		if thresholdDays == 0 {
+		if task.ExpirationThreshold == 0 {
 			// Threshold is 0: disable optimization, terminate all sectors
 			sectorDetail.Strategy = "terminate"
 			sectorDetail.RecommendedFee = termFee
@@ -427,7 +499,7 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 
 		sectorDetails = append(sectorDetails, sectorDetail)
 
-		if verbose {
+		if task.Verbose {
 			fmt.Printf("  Sector %d: %s (%.1f days) -> %s FIL\n",
 				sector.SectorNumber, sectorDetail.Strategy, sectorDetail.RemainingDays,
 				types.FIL(sectorDetail.RecommendedFee).String())
@@ -442,7 +514,7 @@ func calculateMinerStrategy(ctx context.Context, api api.FullNode, minerID strin
 	result.SectorDetails = sectorDetails
 	result.Status = "success"
 
-	if verbose {
+	if task.Verbose {
 		fmt.Printf("  Summary: %d terminate, %d expire, total fee: %s FIL\n",
 			terminateCount, expireCount, types.FIL(result.TotalFee).String())
 	}
@@ -512,9 +584,9 @@ func writeStrategyResults(filename string, results []StrategyResult) error {
 
 func printStrategyResults(results []StrategyResult, verbose bool) {
 	fmt.Printf("\n=== Strategy Results ===\n")
-	fmt.Printf("%-12s %-10s %-8s %-6s %-6s %-6s %-15s %-15s %-15s %s\n",
+	fmt.Printf("%-12s %-10s %-8s %-6s %-6s %-6s %-20s %-20s %-20s %s\n",
 		"MinerID", "Epoch", "Status", "Total", "Term.", "Exp.", "TermFee(FIL)", "ExpFee(FIL)", "TotalFee(FIL)", "Error")
-	fmt.Println(strings.Repeat("-", 120))
+	fmt.Println(strings.Repeat("-", 135))
 
 	for _, result := range results {
 		errorMsg := result.Error
@@ -522,7 +594,7 @@ func printStrategyResults(results []StrategyResult, verbose bool) {
 			errorMsg = errorMsg[:20] + "..."
 		}
 
-		fmt.Printf("%-12s %-10d %-8s %-6d %-6d %-6d %-15s %-15s %-15s %s\n",
+		fmt.Printf("%-12s %-10d %-8s %-6d %-6d %-6d %-20s %-20s %-20s %s\n",
 			result.MinerID,
 			result.TerminationEpoch,
 			result.Status,
